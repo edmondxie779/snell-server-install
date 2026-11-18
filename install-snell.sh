@@ -33,12 +33,21 @@ readonly OPENRC_INIT=/etc/init.d/snell
 readonly OPENRC_LOG_DIR=/var/log/snell
 readonly OPENRC_LOG=/var/log/snell/snell.log
 
+# Overridable paths for safe isolated testing.
+SYSTEMD_UNIT_DIRS=(/etc/systemd/system /lib/systemd/system /usr/lib/systemd/system)
+OPENRC_INIT_DIR=/etc/init.d
+LEGACY_BIN_PATHS=(/usr/local/bin/snell-server /usr/bin/snell-server /opt/snell/snell-server /root/snell-server)
+LEGACY_CONF_PATHS=(/etc/snell /etc/snell-server /opt/snell)
+INSTALL_LOG=/var/log/snell-install.log
+
 SNELL_MAJOR=5
 SNELL_VERSION=$SNELL_V5_VERSION
 SNELL_MODE=default
 CLI_VERSION=''
 CLI_MODE=''
 AUTO_YES=0
+FORCE_CLEAN=0
+DO_UNINSTALL=0
 
 OS_ID=''
 OS_FAMILY=''
@@ -54,9 +63,12 @@ OWNED_FILES=()
 OWNED_IDS=()
 ENABLE_CHANGED=0
 BOOT_STATUS='已设置开机启动'
+FIREWALL_STATUS='未检测到拦截规则，保持放行'
 DONE=0
 REINSTALL=0
+REINSTALL_MODE=reuse
 BACKUP=''
+LEGACY_BACKUP=''
 OLD_ACTIVE=0
 OLD_ENABLED='disabled'
 REUSE_CONFIG=0
@@ -67,9 +79,44 @@ NODE_EXTRA=''
 REMOVE_OBFS=0
 REMOVE_OBFS_CONFIRMED=0
 UPDATE_MODE=0
+REINSTALL_ALLOW_CLEAN_FALLBACK=0
+REINSTALL_REJECT_REASON=''
 
-info() { printf '\n%s\n' "$*"; }
-fail() { printf '\n错误：%s\n' "$*" >&2; exit 1; }
+FOUND_ANY=0
+FOUND_STANDARD=0
+FOUND_BINS=()
+FOUND_CONFS=()
+FOUND_SYSTEMD_UNITS=()
+FOUND_OPENRC_SCRIPTS=()
+FOUND_PROC=0
+
+log_msg() {
+    if [[ -n ${INSTALL_LOG:-} && -w $(dirname "$INSTALL_LOG") ]]; then
+        printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo 'time')" "$*" >> "$INSTALL_LOG" 2>/dev/null || true
+    fi
+}
+
+info() {
+    log_msg "INFO: $*"
+    printf '\n%s\n' "$*"
+}
+
+fail() {
+    log_msg "ERROR: $*"
+    printf '\n错误：%s\n' "$*" >&2
+    if [[ -n ${INSTALL_LOG:-} && -f $INSTALL_LOG ]]; then
+        printf '详细日志：%s\n' "$INSTALL_LOG" >&2
+    fi
+    exit 1
+}
+
+reinstall_reject() {
+    if [[ $REINSTALL_ALLOW_CLEAN_FALLBACK == 1 ]]; then
+        REINSTALL_REJECT_REASON=$1
+        return 2
+    fi
+    fail "$1"
+}
 
 cleanup() {
     local rc=$?
@@ -80,9 +127,9 @@ cleanup() {
         svc_stop >/dev/null 2>&1
         if (( ${#OWNED_FILES[@]} > 0 )); then
             for ((i=0; i<${#OWNED_FILES[@]}; i++)); do
-                file=${OWNED_FILES[$i]}
+                file=${OWNED_FILES[i]}
                 if [[ -e $file || -L $file ]]; then
-                    if [[ -L $file || $(file_identity "$file") != "${OWNED_IDS[$i]}" ]]; then
+                    if [[ -L $file || $(file_identity "$file") != "${OWNED_IDS[i]}" ]]; then
                         printf '警告：文件被其他程序替换，未删除：%s\n' "$file" >&2
                         restore_failed=1
                         continue
@@ -111,6 +158,9 @@ cleanup() {
         else
             printf '\n警告：自动恢复未全部成功，请检查 snell 服务；备份：%s\n' "$BACKUP" >&2
         fi
+        if [[ -n $LEGACY_BACKUP ]]; then
+            printf '原第三方安装备份位于：%s\n' "$LEGACY_BACKUP" >&2
+        fi
     fi
     [[ -z $WORK ]] || rm -rf -- "$WORK"
     exit "$rc"
@@ -134,6 +184,16 @@ restore_selinux_context() {
     fi
 }
 
+add_unique() {
+    local arr_name=$1 val=$2 existing
+    [[ -n $val ]] || return 0
+    local -n arr_ref=$arr_name
+    for existing in "${arr_ref[@]+"${arr_ref[@]}"}"; do
+        [[ $existing == "$val" ]] && return 0
+    done
+    arr_ref+=("$val")
+}
+
 # Service manager abstraction (systemd / OpenRC).
 svc_exists() {
     if [[ $INIT_SYS == openrc ]]; then
@@ -141,8 +201,10 @@ svc_exists() {
         command -v rc-service >/dev/null 2>&1 && rc-service -e snell >/dev/null 2>&1 && return 0
         return 1
     fi
-    [[ $(systemctl show snell.service -p LoadState --value) != not-found ]] && return 0
-    systemctl list-unit-files --no-legend --no-pager | grep -qi snell && return 0
+    [[ $(systemctl show snell.service -p LoadState --value 2>/dev/null || echo not-found) != not-found ]] && return 0
+    local unit_list
+    unit_list=$(systemctl list-unit-files --no-legend --no-pager 2>/dev/null || true)
+    grep -qi snell <<< "$unit_list" && return 0
     return 1
 }
 
@@ -151,7 +213,7 @@ svc_loaded() {
         [[ -e $OPENRC_INIT || -L $OPENRC_INIT ]]
         return
     fi
-    [[ $(systemctl show snell.service -p LoadState --value) != not-found ]]
+    [[ $(systemctl show snell.service -p LoadState --value 2>/dev/null || echo not-found) != not-found ]]
 }
 
 svc_is_active() {
@@ -164,7 +226,9 @@ svc_is_active() {
 
 svc_is_enabled() {
     if [[ $INIT_SYS == openrc ]]; then
-        if rc-update show default 2>/dev/null | awk '{print $1}' | grep -qx snell; then
+        local show_out
+        show_out=$(rc-update show default 2>/dev/null || true)
+        if awk '$1 == "snell" {found=1} END {exit !found}' <<< "$show_out"; then
             echo enabled
         else
             echo disabled
@@ -221,7 +285,7 @@ svc_exec_matches() {
         return 0
     fi
     local exec_start
-    exec_start=$(systemctl show snell.service -p ExecStart --value)
+    exec_start=$(systemctl show snell.service -p ExecStart --value 2>/dev/null || true)
     [[ $exec_start == *"path=$BIN ;"* && $exec_start == *" -c $CONF_DIR/snell-server.conf "* ]]
 }
 
@@ -304,12 +368,16 @@ ensure_service_user() {
         if ! getent group snell-auto >/dev/null 2>&1; then
             addgroup -S snell-auto
         fi
-        adduser -S -D -H -h /nonexistent -s /sbin/nologin -G snell-auto snell-auto
+        if ! getent passwd snell-auto >/dev/null 2>&1; then
+            adduser -S -D -H -h /nonexistent -s /sbin/nologin -G snell-auto snell-auto
+        fi
     else
         local nologin=/usr/sbin/nologin
         [[ -x $nologin ]] || nologin=/sbin/nologin
-        useradd --system --user-group --no-create-home --home-dir /nonexistent \
-            --shell "$nologin" snell-auto
+        if ! getent passwd snell-auto >/dev/null 2>&1; then
+            useradd --system --user-group --no-create-home --home-dir /nonexistent \
+                --shell "$nologin" snell-auto
+        fi
     fi
 }
 
@@ -319,6 +387,7 @@ remove_service_user() {
         delgroup snell-auto >/dev/null 2>&1 || true
     else
         userdel snell-auto >/dev/null 2>&1 || true
+        if getent group snell-auto >/dev/null 2>&1; then groupdel snell-auto >/dev/null 2>&1 || true; fi
     fi
 }
 
@@ -361,6 +430,213 @@ existing_install() {
     return 1
 }
 
+scan_existing_snell() {
+    FOUND_ANY=0
+    FOUND_STANDARD=0
+    FOUND_BINS=()
+    FOUND_CONFS=()
+    FOUND_SYSTEMD_UNITS=()
+    FOUND_OPENRC_SCRIPTS=()
+    FOUND_PROC=0
+
+    local path unit_dir unit_file unit_name cmd_bin exec_line conf_arg
+    for path in "$BIN" "${LEGACY_BIN_PATHS[@]}"; do
+        [[ -e $path || -L $path ]] && add_unique FOUND_BINS "$path"
+    done
+    cmd_bin=$(command -v snell-server 2>/dev/null || true)
+    [[ -n $cmd_bin ]] && add_unique FOUND_BINS "$cmd_bin"
+
+    for path in "$CONF_DIR" "${LEGACY_CONF_PATHS[@]}"; do
+        [[ -e $path || -L $path ]] && add_unique FOUND_CONFS "$path"
+    done
+
+    if [[ $INIT_SYS == systemd ]] && command -v systemctl >/dev/null 2>&1; then
+        local unit_list
+        unit_list=$(systemctl list-unit-files --no-legend --no-pager '*snell*' 2>/dev/null | awk '{print $1}' || true)
+        for unit_name in $unit_list; do
+            [[ -n $unit_name ]] && add_unique FOUND_SYSTEMD_UNITS "$unit_name"
+        done
+        for unit_dir in "${SYSTEMD_UNIT_DIRS[@]}"; do
+            [[ -d $unit_dir ]] || continue
+            for unit_file in "$unit_dir"/*snell*.service; do
+                [[ -e $unit_file || -L $unit_file ]] || continue
+                unit_name=${unit_file##*/}
+                add_unique FOUND_SYSTEMD_UNITS "$unit_name"
+                if [[ -f $unit_file ]]; then
+                    exec_line=$(awk -F= '/^[[:space:]]*ExecStart[[:space:]]*=/{print $2; exit}' "$unit_file" || true)
+                    if [[ -n $exec_line ]]; then
+                        cmd_bin=$(awk '{print $1}' <<< "$exec_line")
+                        [[ $cmd_bin == /* ]] && [[ -e $cmd_bin || -L $cmd_bin ]] && add_unique FOUND_BINS "$cmd_bin"
+                        conf_arg=$(sed -n 's/.*[[:space:]]-c[[:space:]]\([^[:space:]]*\).*/\1/p' <<< "$exec_line")
+                        [[ $conf_arg == /* ]] && [[ -e $conf_arg || -L $conf_arg ]] && add_unique FOUND_CONFS "$conf_arg"
+                    fi
+                fi
+            done
+        done
+    fi
+
+    if [[ -e $OPENRC_INIT || -L $OPENRC_INIT ]]; then
+        add_unique FOUND_OPENRC_SCRIPTS "$OPENRC_INIT"
+    fi
+    if [[ -d $OPENRC_INIT_DIR ]]; then
+        for path in "$OPENRC_INIT_DIR"/snell*; do
+            [[ -e $path || -L $path ]] && add_unique FOUND_OPENRC_SCRIPTS "$path"
+        done
+    fi
+
+    if pgrep -x snell-server >/dev/null 2>&1; then
+        FOUND_PROC=1
+    fi
+
+    if (( ${#FOUND_BINS[@]} > 0 || ${#FOUND_CONFS[@]} > 0 || ${#FOUND_SYSTEMD_UNITS[@]} > 0 || ${#FOUND_OPENRC_SCRIPTS[@]} > 0 || FOUND_PROC == 1 )); then
+        FOUND_ANY=1
+    else
+        return 0
+    fi
+
+    # Check if this matches a single standard installation managed by this script.
+    if (( ${#FOUND_BINS[@]} <= 1 && ${#FOUND_CONFS[@]} <= 1 && ${#FOUND_SYSTEMD_UNITS[@]} <= 1 && ${#FOUND_OPENRC_SCRIPTS[@]} <= 1 )); then
+        local bin_ok=1 conf_ok=1 svc_ok=1
+        if (( ${#FOUND_BINS[@]} == 1 )) && [[ ${FOUND_BINS[0]} != "$BIN" ]]; then bin_ok=0; fi
+        if (( ${#FOUND_CONFS[@]} == 1 )) && [[ ${FOUND_CONFS[0]} != "$CONF_DIR" ]]; then conf_ok=0; fi
+        if [[ $INIT_SYS == systemd ]]; then
+            if (( ${#FOUND_OPENRC_SCRIPTS[@]} > 0 )); then svc_ok=0; fi
+            if (( ${#FOUND_SYSTEMD_UNITS[@]} == 1 )) && [[ ${FOUND_SYSTEMD_UNITS[0]} != snell.service ]]; then svc_ok=0; fi
+        else
+            if (( ${#FOUND_SYSTEMD_UNITS[@]} > 0 )); then svc_ok=0; fi
+            if (( ${#FOUND_OPENRC_SCRIPTS[@]} == 1 )) && [[ ${FOUND_OPENRC_SCRIPTS[0]} != "$OPENRC_INIT" ]]; then svc_ok=0; fi
+        fi
+        if [[ $bin_ok == 1 && $conf_ok == 1 && $svc_ok == 1 ]]; then
+            FOUND_STANDARD=1
+        fi
+    fi
+}
+
+print_found_summary() {
+    local item
+    if (( ${#FOUND_SYSTEMD_UNITS[@]} > 0 )); then
+        printf '  - systemd 服务：%s\n' "${FOUND_SYSTEMD_UNITS[*]}"
+    fi
+    if (( ${#FOUND_OPENRC_SCRIPTS[@]} > 0 )); then
+        printf '  - OpenRC 服务：%s\n' "${FOUND_OPENRC_SCRIPTS[*]}"
+    fi
+    if (( ${#FOUND_BINS[@]} > 0 )); then
+        for item in "${FOUND_BINS[@]}"; do printf '  - 程序文件：%s\n' "$item"; done
+    fi
+    if (( ${#FOUND_CONFS[@]} > 0 )); then
+        for item in "${FOUND_CONFS[@]}"; do printf '  - 配置路径：%s\n' "$item"; done
+    fi
+    if [[ $FOUND_PROC == 1 ]]; then
+        printf '  - 运行中进程：snell-server\n'
+    fi
+}
+
+uninstall_existing_snell() {
+    local item unit_dir unit_file n=0
+    info '正在备份并卸载原有的 Snell……'
+    install -d -m 700 /var/backups/snell
+    LEGACY_BACKUP=$(mktemp -d /var/backups/snell/legacy-backup-XXXXXXXX)
+
+    # 1. Back up discovered files before stopping/removing.
+    for item in "${FOUND_BINS[@]+"${FOUND_BINS[@]}"}"; do
+        if [[ -f $item && ! -L $item ]]; then
+            cp -a -- "$item" "$LEGACY_BACKUP/" 2>/dev/null || true
+        fi
+    done
+    for item in "${FOUND_CONFS[@]+"${FOUND_CONFS[@]}"}"; do
+        if [[ -d $item && ! -L $item ]]; then
+            cp -a -- "$item" "$LEGACY_BACKUP/" 2>/dev/null || true
+        elif [[ -f $item && ! -L $item ]]; then
+            cp -a -- "$item" "$LEGACY_BACKUP/" 2>/dev/null || true
+        fi
+    done
+    for item in "${FOUND_SYSTEMD_UNITS[@]+"${FOUND_SYSTEMD_UNITS[@]}"}"; do
+        if command -v systemctl >/dev/null 2>&1; then
+            systemctl cat "$item" > "$LEGACY_BACKUP/${item}.txt" 2>/dev/null || true
+        fi
+        for unit_dir in "${SYSTEMD_UNIT_DIRS[@]}"; do
+            unit_file="$unit_dir/$item"
+            if [[ -f $unit_file && ! -L $unit_file ]]; then
+                cp -a -- "$unit_file" "$LEGACY_BACKUP/" 2>/dev/null || true
+            fi
+        done
+    done
+    for item in "${FOUND_OPENRC_SCRIPTS[@]+"${FOUND_OPENRC_SCRIPTS[@]}"}"; do
+        if [[ -f $item && ! -L $item ]]; then
+            cp -a -- "$item" "$LEGACY_BACKUP/" 2>/dev/null || true
+        fi
+    done
+    info "原有 Snell 相关文件已备份到：$LEGACY_BACKUP（仅 root 可访问）"
+
+    # 2. Stop & disable systemd services.
+    if (( ${#FOUND_SYSTEMD_UNITS[@]} > 0 )) && command -v systemctl >/dev/null 2>&1; then
+        for item in "${FOUND_SYSTEMD_UNITS[@]}"; do
+            systemctl stop "$item" >/dev/null 2>&1 || true
+            systemctl disable "$item" >/dev/null 2>&1 || true
+            for unit_dir in "${SYSTEMD_UNIT_DIRS[@]}"; do
+                unit_file="$unit_dir/$item"
+                if [[ -e $unit_file || -L $unit_file ]]; then
+                    rm -f -- "$unit_file" || true
+                fi
+            done
+        done
+        systemctl daemon-reload >/dev/null 2>&1 || true
+        systemctl reset-failed >/dev/null 2>&1 || true
+    fi
+
+    # 3. Stop & disable OpenRC services.
+    for item in "${FOUND_OPENRC_SCRIPTS[@]+"${FOUND_OPENRC_SCRIPTS[@]}"}"; do
+        local rc_name=${item##*/}
+        if command -v rc-service >/dev/null 2>&1; then
+            rc-service "$rc_name" stop >/dev/null 2>&1 || true
+        fi
+        if command -v rc-update >/dev/null 2>&1; then
+            rc-update del "$rc_name" default >/dev/null 2>&1 || true
+        fi
+        rm -f -- "$item" || true
+    done
+
+    # 4. Stop any leftover snell-server processes.
+    if pgrep -x snell-server >/dev/null 2>&1; then
+        pkill -TERM -x snell-server >/dev/null 2>&1 || true
+        for ((n=0; n<10; n++)); do
+            pgrep -x snell-server >/dev/null 2>&1 || break
+            sleep 0.5
+        done
+        if pgrep -x snell-server >/dev/null 2>&1; then
+            pkill -KILL -x snell-server >/dev/null 2>&1 || true
+            sleep 0.5
+        fi
+    fi
+
+    # 5. Remove discovered binaries and config directories/files.
+    for item in "${FOUND_BINS[@]+"${FOUND_BINS[@]}"}"; do
+        rm -f -- "$item" || true
+    done
+    for item in "${FOUND_CONFS[@]+"${FOUND_CONFS[@]}"}"; do
+        if [[ -L $item ]]; then
+            rm -f -- "$item" || true
+        elif [[ -d $item ]]; then
+            rm -rf -- "$item" || true
+        elif [[ -f $item ]]; then
+            rm -f -- "$item" || true
+        fi
+    done
+    if [[ -L $UNIT || -e $UNIT ]]; then rm -f -- "$UNIT" || true; fi
+    if [[ -L $OPENRC_INIT || -e $OPENRC_INIT ]]; then rm -f -- "$OPENRC_INIT" || true; fi
+
+    # 6. Clean up snell-auto user if left over from an incomplete install.
+    remove_service_user
+
+    REINSTALL=0
+    REUSE_CONFIG=0
+    REUSE_UNIT=0
+    OLD_PORT=''
+    OLD_PSK=''
+    NODE_EXTRA=''
+    OLD_ACTIVE=0
+}
+
 valid_ipv4() {
     [[ $1 =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || return 1
     local a b c d
@@ -382,34 +658,43 @@ config_value() {
         }' "$CONF_DIR/snell-server.conf"
 }
 
+PARSED_PORT=''
+
 parse_listen_port() {
     local listen=$1 item port='' item_port
+    PARSED_PORT=''
     if [[ $listen == *,* ]]; then
         if [[ $SNELL_MAJOR != 6 ]]; then
-            fail '原配置使用了多地址 listen，仅 Snell v6 支持；请先修改 listen 后再安装 v4/v5。'
+            reinstall_reject '原配置使用了多地址 listen，仅 Snell v6 支持；请先修改 listen 后再安装 v4/v5。' || return $?
         fi
         local items
         IFS=',' read -r -a items <<< "$listen"
         for item in "${items[@]}"; do
             item=${item#"${item%%[![:space:]]*}"}
             item=${item%"${item##*[![:space:]]}"}
-            [[ $item =~ ^(0\.0\.0\.0|\[::\]):([0-9]{1,5})$ ]] || \
-                fail '原配置不是标准公网监听格式；未修改，请先检查 listen。'
+            if ! [[ $item =~ ^(0\.0\.0\.0|\[::\]):([0-9]{1,5})$ ]]; then
+                reinstall_reject '原配置不是标准公网监听格式；未修改，请先检查 listen。' || return $?
+            fi
             item_port=$((10#${BASH_REMATCH[2]}))
-            (( item_port >= 1 && item_port <= 65535 )) || fail '原配置端口无效。'
+            if ! (( item_port >= 1 && item_port <= 65535 )); then
+                reinstall_reject '原配置端口无效。' || return $?
+            fi
             if [[ -z $port ]]; then
                 port=$item_port
             elif [[ $port != "$item_port" ]]; then
-                fail '原配置多地址 listen 端口不一致；未修改，请先检查 listen。'
+                reinstall_reject '原配置多地址 listen 端口不一致；未修改，请先检查 listen。' || return $?
             fi
         done
     else
-        [[ $listen =~ ^(0\.0\.0\.0|\[::\]):([0-9]{1,5})$ ]] || \
-            fail '原配置不是单端口公网监听格式；未修改，请先检查 listen。'
+        if ! [[ $listen =~ ^(0\.0\.0\.0|\[::\]):([0-9]{1,5})$ ]]; then
+            reinstall_reject '原配置不是单端口公网监听格式；未修改，请先检查 listen。' || return $?
+        fi
         port=$((10#${BASH_REMATCH[2]}))
-        (( port >= 1 && port <= 65535 )) || fail '原配置端口无效。'
+        if ! (( port >= 1 && port <= 65535 )); then
+            reinstall_reject '原配置端口无效。' || return $?
+        fi
     fi
-    printf '%s' "$port"
+    PARSED_PORT=$port
 }
 
 rewrite_config_for_v6() {
@@ -449,7 +734,7 @@ rewrite_config_for_v6() {
 }
 
 prepare_reinstall() {
-    local file listen obfs old_mode dns_pref answer
+    local file listen obfs old_mode dns_pref answer rc=0
     REUSE_CONFIG=0
     REUSE_UNIT=0
     OLD_PORT=''
@@ -457,16 +742,26 @@ prepare_reinstall() {
     NODE_EXTRA=''
     REMOVE_OBFS=0
     UPDATE_MODE=0
-    [[ ! -L $CONF_DIR ]] || fail '配置目录是符号链接；请先确认实际安装路径。'
-    [[ ! -e $CONF_DIR || -d $CONF_DIR ]] || fail '配置目录位置被普通文件占用。'
+    if [[ -L $CONF_DIR ]]; then
+        reinstall_reject '配置目录是符号链接；请先确认实际安装路径。' || return $?
+    fi
+    if [[ -e $CONF_DIR && ! -d $CONF_DIR ]]; then
+        reinstall_reject '配置目录位置被普通文件占用。' || return $?
+    fi
     for file in "$BIN" "$SERVICE_FILE" "$CONF_DIR/snell-server.conf" "$CONF_DIR/surge-proxy.txt"; do
-        [[ ! -L $file && ( ! -e $file || -f $file ) ]] || fail "不能自动覆盖符号链接或特殊文件：$file"
+        if [[ -L $file || ( -e $file && ! -f $file ) ]]; then
+            reinstall_reject "不能自动覆盖符号链接或特殊文件：$file" || return $?
+        fi
     done
     if [[ -f $CONF_DIR/snell-server.conf ]]; then
         listen=$(config_value listen)
         OLD_PSK=$(config_value psk)
-        OLD_PORT=$(parse_listen_port "$listen")
-        [[ -n $OLD_PSK && ! $OLD_PSK =~ [[:space:],\;\#] ]] || fail '原密钥格式无法直接输出到 Surge；未修改。'
+        parse_listen_port "$listen" || rc=$?
+        if (( rc != 0 )); then return "$rc"; fi
+        OLD_PORT=$PARSED_PORT
+        if [[ -z $OLD_PSK || $OLD_PSK =~ [[:space:],\;\#] ]]; then
+            reinstall_reject '原密钥格式无法直接输出到 Surge；未修改。' || return $?
+        fi
         obfs=$(config_value obfs)
         old_mode=$(config_value mode)
         dns_pref=$(config_value dns-ip-preference)
@@ -508,19 +803,23 @@ prepare_reinstall() {
             elif [[ -n $old_mode ]]; then
                 case $old_mode in
                     default|unshaped|unsafe-raw) SNELL_MODE=$old_mode ;;
-                    *) fail "原配置的 mode 无效：$old_mode" ;;
+                    *) reinstall_reject "原配置的 mode 无效：$old_mode" || return $? ;;
                 esac
             fi
             if [[ $SNELL_MODE != default ]]; then
                 NODE_EXTRA=", mode=${SNELL_MODE}"
             fi
         else
-            [[ -z $old_mode ]] || fail "原配置包含 Snell v6 专用的 mode=${old_mode}，不适用于 Snell v${SNELL_MAJOR}；请先移除后再降级。"
-            [[ -z $dns_pref ]] || fail "原配置包含 Snell v6 专用的 dns-ip-preference=${dns_pref}，不适用于 Snell v${SNELL_MAJOR}；请先移除后再降级。"
+            if [[ -n $old_mode ]]; then
+                reinstall_reject "原配置包含 Snell v6 专用的 mode=${old_mode}，不适用于 Snell v${SNELL_MAJOR}；请先移除后再降级。" || return $?
+            fi
+            if [[ -n $dns_pref ]]; then
+                reinstall_reject "原配置包含 Snell v6 专用的 dns-ip-preference=${dns_pref}，不适用于 Snell v${SNELL_MAJOR}；请先移除后再降级。" || return $?
+            fi
             case $obfs in
                 ''|off|false) ;;
                 http) NODE_EXTRA=', obfs=http' ;;
-                *) fail "原配置的混淆方式不适用于 Snell v${SNELL_MAJOR}：$obfs" ;;
+                *) reinstall_reject "原配置的混淆方式不适用于 Snell v${SNELL_MAJOR}：$obfs" || return $? ;;
             esac
         fi
         REUSE_CONFIG=1
@@ -531,11 +830,14 @@ prepare_reinstall() {
         fi
     fi
     if svc_loaded; then
-        (svc_exec_matches && [[ $REUSE_CONFIG == 1 ]]) || \
-            fail '已有服务不使用标准程序/配置路径，不能直接覆盖；未修改原服务。'
+        if ! svc_exec_matches || [[ $REUSE_CONFIG != 1 ]]; then
+            reinstall_reject '已有服务不使用标准程序/配置路径，不能直接覆盖；未修改原服务。' || return $?
+        fi
         REUSE_UNIT=1
     fi
-    [[ $REUSE_CONFIG == 0 || $REUSE_UNIT == 1 ]] || fail '原配置存在但原服务缺失，请先恢复服务文件后重装。'
+    if ! [[ $REUSE_CONFIG == 0 || $REUSE_UNIT == 1 ]]; then
+        reinstall_reject '原配置存在但原服务缺失，请先恢复服务文件后重装。' || return $?
+    fi
 }
 
 backup_install() {
@@ -581,21 +883,23 @@ show_result() {
     printf '  连接密钥    %s%s%s\n' "$bold" "$psk" "$reset"
     printf '  协议版本    Snell v%s（服务端 %s%s）\n' "$SNELL_MAJOR" "$SNELL_VERSION" "$version_note"
     printf '  服务状态    %s● 本机已启动 · %s%s\n' "$green" "$BOOT_STATUS" "$reset"
+    printf '  系统防火墙  %s\n' "$FIREWALL_STATUS"
     printf '\n%s━━━━━━━━━━ 复制下面这行到 Surge ━━━━━━━━━━%s\n\n' "$cyan" "$reset"
     # A single, undecorated node line: safe to select and paste into [Proxy].
     printf '%s我的VPS = snell, %s, %s, psk=%s, version=%s%s%s\n' "$bold" "$public_ip" "$port" "$psk" "$SNELL_MAJOR" "$NODE_EXTRA" "$reset"
     printf '\n%s━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━%s\n\n' "$cyan" "$reset"
     printf '  添加位置：Surge 配置 → [Proxy]\n'
     if [[ $SNELL_MAJOR == 5 ]]; then
-        printf '  %s安全组需放行：%s / TCP + UDP（v5 QUIC Proxy 需要 UDP）%s\n' "$yellow" "$port" "$reset"
+        printf '  %s云厂商安全组需放行：%s / TCP + UDP（v5 QUIC Proxy 需要 UDP）%s\n' "$yellow" "$port" "$reset"
     else
-        printf '  %s安全组需放行：%s / TCP + UDP%s\n' "$yellow" "$port" "$reset"
+        printf '  %s云厂商安全组需放行：%s / TCP + UDP%s\n' "$yellow" "$port" "$reset"
     fi
     if [[ $SNELL_MAJOR == 6 ]]; then
         printf '  %s提示：Snell v6 处于 Beta 阶段，需同步使用支持 v6 的 Surge 客户端。%s\n' "$yellow" "$reset"
     fi
     printf '  配置已保存：%s/surge-proxy.txt\n' "$CONF_DIR"
     if [[ -n $BACKUP ]]; then printf '  原安装备份：%s\n' "$BACKUP"; fi
+    if [[ -n $LEGACY_BACKUP ]]; then printf '  原旧版备份：%s\n' "$LEGACY_BACKUP"; fi
     printf '  %s节点含密钥，请勿公开分享或截图。%s\n' "$yellow" "$reset"
     printf '\n  本机启动不代表公网可连接，请在 Surge 中测试节点。\n'
     printf '  NAT VPS 还需配置端口映射。\n\n'
@@ -636,7 +940,9 @@ usage() {
   -v, --version <4|5|6>              指定安装的 Snell 主版本（4.1.1 / 5.0.1 / 6.0.0）
       --mode <default|unshaped|unsafe-raw>
                                      仅 Snell v6 可用，设置传输模式（默认 default）
-  -y, --yes                          跳过交互确认（重装升级 v6 时将自动移除 obfs）
+      --clean                        强制备份并卸载原有 Snell 后全新安装
+      --uninstall                    备份并彻底卸载本机已安装的 Snell 后退出
+  -y, --yes                          跳过交互确认
   -h, --help                         显示此帮助信息
 EOF
 }
@@ -660,6 +966,14 @@ parse_args() {
                 ;;
             --mode=*)
                 CLI_MODE=${1#*=}
+                shift
+                ;;
+            --clean)
+                FORCE_CLEAN=1
+                shift
+                ;;
+            --uninstall)
+                DO_UNINSTALL=1
                 shift
                 ;;
             -y|--yes)
@@ -853,18 +1167,153 @@ install_dependencies() {
     esac
 }
 
-configure_firewall() {
-    local port=$1 firewall_found=0
-    if command -v ufw >/dev/null 2>&1 && ufw status | grep -q '^Status: active'; then
-        firewall_found=1
-        if ! ufw allow "$port/tcp" || ! ufw allow "$port/udp"; then
-            info "警告：UFW 放行未全部成功，请手动放行 ${port}/TCP 和 UDP。"
+iptables_is_filtering() {
+    local ipt_cmd=$1 rules
+    command -v "$ipt_cmd" >/dev/null 2>&1 || return 1
+    rules=$("$ipt_cmd" -S INPUT 2>/dev/null) || return 1
+    grep -qE '^-P INPUT (DROP|REJECT)$|-j (DROP|REJECT)([[:space:]]|$)' <<< "$rules"
+}
+
+persist_iptables() {
+    local persisted=0
+    if command -v netfilter-persistent >/dev/null 2>&1; then
+        if netfilter-persistent save >/dev/null 2>&1; then
+            persisted=1
+        fi
+        if [[ $INIT_SYS == systemd ]] && command -v systemctl >/dev/null 2>&1; then
+            systemctl enable netfilter-persistent >/dev/null 2>&1 || true
+        fi
+    elif [[ $OS_FAMILY == alpine ]]; then
+        if [[ -x /etc/init.d/iptables ]] && rc-service iptables save >/dev/null 2>&1; then
+            rc-update add iptables default >/dev/null 2>&1 || true
+            persisted=1
+        elif command -v iptables-save >/dev/null 2>&1 && [[ -d /etc/iptables ]]; then
+            iptables-save > /etc/iptables/rules-save 2>/dev/null && persisted=1
+        fi
+        if command -v ip6tables-save >/dev/null 2>&1 && [[ -x /etc/init.d/ip6tables ]]; then
+            rc-service ip6tables save >/dev/null 2>&1 || true
+            rc-update add ip6tables default >/dev/null 2>&1 || true
+        fi
+    elif [[ $OS_FAMILY == debian ]]; then
+        if [[ -d /etc/iptables || -f /etc/iptables/rules.v4 ]]; then
+            mkdir -p /etc/iptables
+            if [[ -f /etc/iptables/rules.v4 ]]; then
+                install -d -m 700 /var/backups/snell
+                cp -a -- /etc/iptables/rules.v4 "/var/backups/snell/rules.v4.$(date +%s)" 2>/dev/null || true
+            fi
+            if iptables-save > /etc/iptables/rules.v4 2>/dev/null; then
+                persisted=1
+            fi
+            if command -v ip6tables-save >/dev/null 2>&1; then
+                ip6tables-save > /etc/iptables/rules.v6 2>/dev/null || true
+            fi
+        elif command -v apt-get >/dev/null 2>&1 && command -v debconf-set-selections >/dev/null 2>&1; then
+            printf 'iptables-persistent iptables-persistent/autosave_v4 boolean true\n' | debconf-set-selections
+            printf 'iptables-persistent iptables-persistent/autosave_v6 boolean true\n' | debconf-set-selections
+            if DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends iptables-persistent >/dev/null 2>&1; then
+                if command -v netfilter-persistent >/dev/null 2>&1 && netfilter-persistent save >/dev/null 2>&1; then
+                    systemctl enable netfilter-persistent >/dev/null 2>&1 || true
+                    persisted=1
+                fi
+            fi
+        fi
+    elif [[ $OS_FAMILY == rhel ]]; then
+        if [[ -d /etc/sysconfig ]]; then
+            if [[ -f /etc/sysconfig/iptables ]]; then
+                install -d -m 700 /var/backups/snell
+                cp -a -- /etc/sysconfig/iptables "/var/backups/snell/iptables.$(date +%s)" 2>/dev/null || true
+            fi
+            if iptables-save > /etc/sysconfig/iptables 2>/dev/null; then
+                persisted=1
+                if command -v systemctl >/dev/null 2>&1; then
+                    local ipt_units
+                    ipt_units=$(systemctl list-unit-files --no-legend --no-pager 'iptables*' 2>/dev/null || true)
+                    if grep -q '^iptables\.service' <<< "$ipt_units"; then
+                        systemctl enable iptables >/dev/null 2>&1 || true
+                    fi
+                fi
+            fi
         fi
     fi
+    [[ $persisted == 1 ]]
+}
+
+nft_blocking_input_chains() {
+    local ruleset
+    ruleset=$(nft list ruleset 2>/dev/null) || return 0
+    awk '
+        /^[[:space:]]*table[[:space:]]+/ {
+            fam = $2; tbl = $3; gsub(/\{.*/, "", tbl); ch = ""; is_in = 0; blocks = 0; next
+        }
+        /^[[:space:]]*chain[[:space:]]+/ {
+            ch = $2; gsub(/\{.*/, "", ch); is_in = 0; blocks = 0; next
+        }
+        ch != "" && /hook[[:space:]]+input([[:space:]]|;|$)/ { is_in = 1 }
+        ch != "" && (/policy[[:space:]]+drop/ || /(^|[[:space:];])(drop|reject)([[:space:];]|$)/) { blocks = 1 }
+        ch != "" && /^[[:space:]]*\}/ {
+            if (is_in && blocks) print fam, tbl, ch
+            ch = ""; is_in = 0; blocks = 0
+        }
+    ' <<< "$ruleset"
+}
+
+persist_nftables() {
+    local conf_path=''
+    case $OS_FAMILY in
+        debian) conf_path=/etc/nftables.conf ;;
+        rhel) conf_path=/etc/sysconfig/nftables.conf ;;
+        alpine) conf_path=/etc/nftables.nft ;;
+    esac
+    [[ -n $conf_path ]] || return 1
+
+    if [[ $OS_FAMILY == alpine && -x /etc/init.d/nftables ]]; then
+        if rc-service nftables save >/dev/null 2>&1; then
+            rc-update add nftables default >/dev/null 2>&1 || true
+            return 0
+        fi
+    fi
+
+    local ruleset tmp
+    ruleset=$(nft list ruleset 2>/dev/null) || return 1
+    [[ -n $ruleset ]] || return 1
+    if [[ -f $conf_path ]]; then
+        install -d -m 700 /var/backups/snell
+        cp -a -- "$conf_path" "/var/backups/snell/${conf_path##*/}.$(date +%s)" 2>/dev/null || true
+    fi
+    tmp=$(mktemp)
+    {
+        printf '#!/usr/sbin/nft -f\nflush ruleset\n\n%s\n' "$ruleset"
+    } > "$tmp"
+    chmod 644 "$tmp"
+    mv -f -- "$tmp" "$conf_path"
+    if [[ $INIT_SYS == systemd ]] && command -v systemctl >/dev/null 2>&1; then
+        systemctl enable nftables >/dev/null 2>&1 || true
+    elif [[ $INIT_SYS == openrc ]] && command -v rc-update >/dev/null 2>&1; then
+        rc-update add nftables default >/dev/null 2>&1 || true
+    fi
+    return 0
+}
+
+configure_firewall() {
+    local port=$1 firewall_found=0
+    local ufw_out=''
+    if command -v ufw >/dev/null 2>&1; then
+        ufw_out=$(ufw status 2>/dev/null || true)
+        if grep -q '^Status: active' <<< "$ufw_out"; then
+            firewall_found=1
+            if ufw allow "$port/tcp" >/dev/null && ufw allow "$port/udp" >/dev/null; then
+                FIREWALL_STATUS="UFW 已放行 ${port}/TCP+UDP（重启后继续生效）"
+            else
+                FIREWALL_STATUS="UFW 放行未全部成功，请手动放行 ${port}/TCP+UDP"
+                info "警告：UFW 放行未全部成功，请手动放行 ${port}/TCP 和 UDP。"
+            fi
+        fi
+    fi
+
     if command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
         firewall_found=1
         # Apply to every active zone, or the default zone when none is active.
-        local zones zone
+        local zones zone fw_ok=1
         if ! zones=$(firewall-cmd --get-active-zones | awk '/^[^[:space:]]/ {print $1}'); then
             zones=''
             info '警告：无法查询 firewalld 活动区域，将尝试默认区域。'
@@ -872,30 +1321,186 @@ configure_firewall() {
         if [[ -z $zones ]]; then
             if ! zones=$(firewall-cmd --get-default-zone); then
                 zones=''
+                fw_ok=0
                 info "警告：无法查询 firewalld 默认区域，请手动放行 ${port}/TCP 和 UDP。"
             fi
         fi
         for zone in $zones; do
-            if ! firewall-cmd --zone="$zone" --add-port="$port/tcp" --add-port="$port/udp" || \
-                ! firewall-cmd --permanent --zone="$zone" --add-port="$port/tcp" --add-port="$port/udp"; then
+            if ! firewall-cmd --zone="$zone" --add-port="$port/tcp" --add-port="$port/udp" >/dev/null || \
+                ! firewall-cmd --permanent --zone="$zone" --add-port="$port/tcp" --add-port="$port/udp" >/dev/null; then
+                fw_ok=0
                 info "警告：firewalld 区域 ${zone} 放行未全部成功，请手动检查。"
             fi
         done
+        if [[ $fw_ok == 1 ]]; then
+            FIREWALL_STATUS="firewalld 已放行 ${port}/TCP+UDP（已写入 permanent 持久化）"
+        else
+            FIREWALL_STATUS="firewalld 部分区域放行失败，请手动检查 ${port}/TCP+UDP"
+        fi
     fi
+
+    # If neither UFW nor firewalld is active, handle iptables / nftables directly and persist rules.
     if [[ $firewall_found == 0 ]]; then
-        info '没有检测到启用的 UFW/firewalld；不改动自定义 nftables/iptables/awall 规则。'
+        local ipt_handled=0 nft_handled=0
+        if iptables_is_filtering iptables; then
+            firewall_found=1
+            ipt_handled=1
+            local ipt_ok=1
+            if ! iptables -C INPUT -p tcp --dport "$port" -j ACCEPT 2>/dev/null; then
+                iptables -I INPUT 1 -p tcp --dport "$port" -j ACCEPT || ipt_ok=0
+            fi
+            if ! iptables -C INPUT -p udp --dport "$port" -j ACCEPT 2>/dev/null; then
+                iptables -I INPUT 1 -p udp --dport "$port" -j ACCEPT || ipt_ok=0
+            fi
+            if iptables_is_filtering ip6tables; then
+                if ! ip6tables -C INPUT -p tcp --dport "$port" -j ACCEPT 2>/dev/null; then
+                    ip6tables -I INPUT 1 -p tcp --dport "$port" -j ACCEPT || ipt_ok=0
+                fi
+                if ! ip6tables -C INPUT -p udp --dport "$port" -j ACCEPT 2>/dev/null; then
+                    ip6tables -I INPUT 1 -p udp --dport "$port" -j ACCEPT || ipt_ok=0
+                fi
+            fi
+            if [[ $ipt_ok == 1 ]]; then
+                if persist_iptables; then
+                    FIREWALL_STATUS="iptables 已放行 ${port}/TCP+UDP（已持久化保存）"
+                else
+                    FIREWALL_STATUS="iptables 已放行 ${port}/TCP+UDP（未检测到持久化服务，重启后可能需重新放行）"
+                    info "警告：已临时放行 iptables ${port}/TCP+UDP，但未能自动持久化；建议安装 netfilter-persistent。"
+                fi
+            else
+                FIREWALL_STATUS="iptables 放行失败，请手动放行 ${port}/TCP+UDP"
+                info "警告：iptables 放行未成功，请手动放行 ${port}/TCP 和 UDP。"
+            fi
+        fi
+
+        # Handle native nftables chains (skip if iptables already handled ip/ip6 filter).
+        if [[ $ipt_handled == 0 ]] && command -v nft >/dev/null 2>&1; then
+            local chains fam tbl ch nft_ok=1
+            chains=$(nft_blocking_input_chains)
+            if [[ -n $chains ]]; then
+                firewall_found=1
+                nft_handled=1
+                while read -r fam tbl ch; do
+                    [[ -n $fam && -n $tbl && -n $ch ]] || continue
+                    local existing_ch
+                    existing_ch=$(nft list chain "$fam" "$tbl" "$ch" 2>/dev/null || true)
+                    if ! grep -Fq "snell-auto-${port}-tcp" <<< "$existing_ch"; then
+                        nft insert rule "$fam" "$tbl" "$ch" tcp dport "$port" accept comment "\"snell-auto-${port}-tcp\"" || nft_ok=0
+                    fi
+                    if ! grep -Fq "snell-auto-${port}-udp" <<< "$existing_ch"; then
+                        nft insert rule "$fam" "$tbl" "$ch" udp dport "$port" accept comment "\"snell-auto-${port}-udp\"" || nft_ok=0
+                    fi
+                done <<< "$chains"
+                if [[ $nft_ok == 1 ]]; then
+                    if persist_nftables; then
+                        FIREWALL_STATUS="nftables 已放行 ${port}/TCP+UDP（已持久化保存）"
+                    else
+                        FIREWALL_STATUS="nftables 已放行 ${port}/TCP+UDP（请确认 nftables 配置已保存）"
+                        info "警告：已放行 nftables ${port}/TCP+UDP，但自动持久化配置未成功，请手动检查。"
+                    fi
+                else
+                    FIREWALL_STATUS="nftables 放行失败，请手动放行 ${port}/TCP+UDP"
+                    info "警告：nftables 放行未成功，请手动放行 ${port}/TCP 和 UDP。"
+                fi
+            fi
+        fi
+
+        if [[ $firewall_found == 0 && $ipt_handled == 0 && $nft_handled == 0 ]]; then
+            FIREWALL_STATUS="本机未启用拦截规则（默认放行）；仍需在云厂商安全组放行 ${port}/TCP+UDP"
+            info '本机没有检测到拦截型防火墙（UFW/firewalld/iptables/nftables）；系统内端口已处于放行状态。'
+        fi
+    fi
+}
+
+confirm_or_clean_existing() {
+    if [[ $DO_UNINSTALL == 1 ]]; then
+        scan_existing_snell
+        if [[ $FOUND_ANY == 0 ]]; then
+            info '未检测到已安装的 Snell，无需卸载。'
+            exit 0
+        fi
+        info '检测到以下 Snell 相关文件/服务：'
+        print_found_summary
+        if [[ $AUTO_YES == 0 ]]; then
+            printf '\n确认备份并彻底卸载上述 Snell？[yes/no，默认 no]：'
+            local ans=''
+            if ! read -r ans; then fail '没有读到确认。'; fi
+            case $ans in
+                yes|YES|Yes|y|Y|on|ON) ;;
+                *) info '已取消卸载。'; exit 0 ;;
+            esac
+        fi
+        uninstall_existing_snell
+        info 'Snell 已备份并卸载完成。'
+        exit 0
+    fi
+
+    if [[ $REINSTALL == 0 ]]; then
+        REINSTALL_MODE=none
+        return 0
+    fi
+
+    if [[ $FORCE_CLEAN == 1 ]]; then
+        REINSTALL_MODE=clean
+        info '已指定 --clean：将在下载完成后备份并彻底卸载原有 Snell，再全新安装。'
+        return 0
+    fi
+
+    if [[ $FOUND_STANDARD == 1 ]]; then
+        if [[ $AUTO_YES == 1 ]]; then
+            REINSTALL_MODE=reuse
+            return 0
+        fi
+        info "发现本机已有标准安装的 Snell，目标版本：v${SNELL_MAJOR}（${SNELL_VERSION}）。"
+        printf '请选择处理方式：\n'
+        printf '  1) 保留原端口和密钥，直接升级/重装（推荐）\n'
+        printf '  2) 备份后彻底卸载旧版，重新生成端口和密钥全新安装\n'
+        printf '  0) 取消退出\n'
+        printf '请输入选项 [1/2/0，默认 1]：'
+        local rchoice=''
+        if ! read -r rchoice; then fail '没有读到选择。请先保存脚本再运行。'; fi
+        case ${rchoice:-1} in
+            1) REINSTALL_MODE=reuse ;;
+            2) REINSTALL_MODE=clean ;;
+            0) info '已取消，没有修改任何内容。'; exit 0 ;;
+            *) fail "无效的选项：$rchoice" ;;
+        esac
+    else
+        REINSTALL_MODE=clean
+        info '检测到本机已有其他方式安装或残留的 Snell：'
+        print_found_summary
+        if [[ $AUTO_YES == 1 ]]; then
+            info '已按 --yes 自动确认：将在下载新版本后备份并卸载上述旧 Snell，再全新安装。'
+        else
+            printf '\n直接覆盖可能导致端口或服务冲突。\n是否备份旧版后彻底卸载，再重新全新安装 Snell v%s？[yes/no，默认 no]：' "$SNELL_MAJOR"
+            local ans=''
+            if ! read -r ans; then fail '没有读到确认。'; fi
+            case $ans in
+                yes|YES|Yes|y|Y|on|ON) ;;
+                *) info '已取消，未作任何修改。'; exit 0 ;;
+            esac
+        fi
     fi
 }
 
 main() {
     parse_args "$@"
     [[ $(uname -s) == Linux ]] || fail '请在 Linux VPS 上运行，不要在 Mac 上运行。'
-    [[ $EUID == 0 ]] || fail '请使用 sudo bash install-snell.sh（或 root 执行）运行。'
+    [[ $EUID == 0 ]] || fail '请使用 sudo sh install-snell.sh（或 root 执行）运行。'
     detect_platform
     command -v flock >/dev/null 2>&1 || fail '缺少 flock（util-linux）。'
     exec 9>/run/lock/snell-auto-install.lock
     flock -n 9 || fail '已有一个安装程序正在运行。'
-    if existing_install; then REINSTALL=1; fi
+
+    scan_existing_snell
+    if [[ $FOUND_ANY == 1 ]] || existing_install; then
+        REINSTALL=1
+    fi
+
+    if [[ $DO_UNINSTALL == 1 ]]; then
+        confirm_or_clean_existing
+        return 0
+    fi
 
     local arch
     case $(uname -m) in
@@ -905,15 +1510,17 @@ main() {
     esac
 
     select_snell_version
+    confirm_or_clean_existing
 
-    if [[ $REINSTALL == 1 ]]; then
-        info "发现已有 Snell，将备份后覆盖重装为 v${SNELL_MAJOR}（${SNELL_VERSION}）。"
-        info '标准安装会保留端口、密钥及兼容配置；重装时连接会短暂中断。'
+    if [[ $REINSTALL_MODE == reuse ]]; then
+        info "将保留端口、密钥及兼容配置覆盖重装为 Snell v${SNELL_MAJOR}（${SNELL_VERSION}）；重装时连接会短暂中断。"
+    elif [[ $REINSTALL_MODE == clean ]]; then
+        info "将在备份并卸载原有 Snell 后，全新安装 Snell v${SNELL_MAJOR}（${SNELL_VERSION}）。"
     else
-        info "将安装 Snell v${SNELL_MAJOR}（${SNELL_VERSION}）：自动端口、随机密钥、开机启动。"
+        info "将安装 Snell v${SNELL_MAJOR}（${SNELL_VERSION}）：自动端口、随机密钥、自动开防火墙并开机启动。"
     fi
 
-    if [[ $AUTO_YES == 0 ]]; then
+    if [[ $AUTO_YES == 0 && $REINSTALL == 0 ]]; then
         printf '是否继续？[yes/no，默认 no]：'
         local answer
         if ! read -r answer; then fail '没有读到确认。请先保存脚本，再直接运行。'; fi
@@ -932,11 +1539,39 @@ main() {
         if valid_ipv4 "$candidate"; then public_ip=$candidate; break; fi
     done
     [[ -n $public_ip ]] || fail '未能检测公网 IPv4；本版暂不支持纯 IPv6 VPS。'
-    if [[ $REINSTALL == 1 ]]; then
-        prepare_reinstall
-    elif existing_install; then
-        fail '确认后有其他程序安装了 Snell，请重新运行以确认覆盖。'
+
+    if [[ $REINSTALL_MODE == reuse ]]; then
+        REINSTALL_ALLOW_CLEAN_FALLBACK=1
+        REINSTALL_REJECT_REASON=''
+        local prep_rc=0
+        prepare_reinstall || prep_rc=$?
+        REINSTALL_ALLOW_CLEAN_FALLBACK=0
+        if (( prep_rc == 2 )); then
+            info "保留配置检查未通过：${REINSTALL_REJECT_REASON}"
+            REUSE_CONFIG=0
+            REUSE_UNIT=0
+            OLD_PORT=''
+            OLD_PSK=''
+            NODE_EXTRA=''
+            if [[ $AUTO_YES == 1 ]]; then
+                REINSTALL_MODE=clean
+                info '已按 --yes 自动切换为：备份并彻底卸载旧版后全新安装。'
+            else
+                printf '原安装无法直接无损继承，是否改为备份并卸载旧版后全新安装？[yes/no，默认 no]：'
+                local fallback_ans=''
+                if ! read -r fallback_ans; then fail '没有读到确认。'; fi
+                case $fallback_ans in
+                    yes|YES|Yes|y|Y|on|ON) REINSTALL_MODE=clean ;;
+                    *) info '已取消，未修改任何内容。'; return 0 ;;
+                esac
+            fi
+        elif (( prep_rc != 0 )); then
+            exit "$prep_rc"
+        fi
+    elif [[ $REINSTALL == 0 ]] && existing_install; then
+        fail '确认后有其他程序安装了 Snell，请重新运行。'
     fi
+
     if [[ $REUSE_CONFIG == 0 ]]; then
         select_v6_mode
         if [[ $SNELL_MAJOR == 6 && $SNELL_MODE != default ]]; then
@@ -966,14 +1601,18 @@ main() {
     chmod 755 "$WORK/snell-server"
 
     info '3/5 创建配置与后台服务……'
-    if [[ $REINSTALL == 1 ]]; then
+    if [[ $REINSTALL_MODE == clean ]]; then
+        scan_existing_snell
+        uninstall_existing_snell
+    elif [[ $REINSTALL_MODE == reuse ]]; then
         # Revalidate and snapshot only after download, before stopping the old service.
         prepare_reinstall
         [[ $port == "$OLD_PORT" && $psk == "$OLD_PSK" || $REUSE_CONFIG == 0 ]] || fail '下载期间原配置发生变化，请重新运行。'
         backup_install
     elif existing_install; then
-        fail '下载期间发现其他 Snell 安装，请重新运行以确认覆盖。'
+        fail '下载期间发现其他 Snell 安装，请重新运行。'
     fi
+
     if [[ $REUSE_UNIT == 0 ]]; then
         if getent passwd snell-auto >/dev/null || getent group snell-auto >/dev/null; then
             fail 'snell-auto 账户已存在但没有可复用的标准服务，请先检查账户用途。'
@@ -1020,10 +1659,12 @@ main() {
     svc_reload
     svc_start
 
-    local ready=0
+    local ready=0 ss_out ss_pid_out
     for ((n=0; n<15; n++)); do
-        if svc_is_active && ss -H -ltn "sport = :$port" | grep -q .; then
-            if ss -H -ltnp "sport = :$port" | grep -q snell-server || pgrep -f "$BIN" >/dev/null 2>&1; then
+        ss_out=$(ss -H -ltn "sport = :$port" 2>/dev/null || true)
+        if svc_is_active && grep -q . <<< "$ss_out"; then
+            ss_pid_out=$(ss -H -ltnp "sport = :$port" 2>/dev/null || true)
+            if grep -q snell-server <<< "$ss_pid_out" || pgrep -f "$BIN" >/dev/null 2>&1; then
                 ready=1
                 break
             fi
@@ -1043,7 +1684,7 @@ main() {
     # Service is now valid. Firewall failures must not destroy a working installation.
     DONE=1
 
-    info '4/5 处理防火墙……'
+    info '4/5 开放并持久化防火墙端口……'
     configure_firewall "$port"
 
     info '5/5 安装流程完成。'

@@ -38,6 +38,20 @@ class InstallerTests(unittest.TestCase):
         source = source.replace("readonly OPENRC_LOG_DIR=/var/log/snell", 'readonly OPENRC_LOG_DIR="$TEST_ROOT/log"')
         source = source.replace("readonly OPENRC_LOG=/var/log/snell/snell.log", 'readonly OPENRC_LOG="$TEST_ROOT/log/snell.log"')
         source = source.replace("/var/backups/snell", self.temp.name + "/backups")
+        source = source.replace(
+            "SYSTEMD_UNIT_DIRS=(/etc/systemd/system /lib/systemd/system /usr/lib/systemd/system)",
+            'SYSTEMD_UNIT_DIRS=("$TEST_ROOT/systemd")',
+        )
+        source = source.replace("OPENRC_INIT_DIR=/etc/init.d", 'OPENRC_INIT_DIR="$TEST_ROOT/init.d"')
+        source = source.replace(
+            "LEGACY_BIN_PATHS=(/usr/local/bin/snell-server /usr/bin/snell-server /opt/snell/snell-server /root/snell-server)",
+            'LEGACY_BIN_PATHS=("$TEST_ROOT/legacy-bin/snell-server")',
+        )
+        source = source.replace(
+            "LEGACY_CONF_PATHS=(/etc/snell /etc/snell-server /opt/snell)",
+            'LEGACY_CONF_PATHS=("$TEST_ROOT/legacy-conf")',
+        )
+        source = source.replace("INSTALL_LOG=/var/log/snell-install.log", 'INSTALL_LOG="$TEST_ROOT/snell-install.log"')
         self.definitions = source + r'''
 systemctl() {
     printf '%s\n' "$*" >> "$TEST_ROOT/systemctl.log"
@@ -460,7 +474,147 @@ exit 1
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("--version", result.stdout)
         self.assertIn("--mode", result.stdout)
+        self.assertIn("--clean", result.stdout)
+        self.assertIn("--uninstall", result.stdout)
+
+    def test_scan_and_uninstall_legacy_snell(self):
+        legacy_systemd = self.root / "systemd"
+        legacy_systemd.mkdir()
+        legacy_unit = legacy_systemd / "snell-server.service"
+        legacy_bin_dir = self.root / "legacy-bin"
+        legacy_bin_dir.mkdir()
+        legacy_bin = legacy_bin_dir / "snell-server"
+        legacy_bin.write_text("legacy-snell-binary\n")
+        legacy_conf = self.root / "legacy-conf"
+        legacy_conf.mkdir()
+        legacy_conf_file = legacy_conf / "config.conf"
+        legacy_conf_file.write_text("[snell-server]\nlisten = 0.0.0.0:19999\npsk = old-secret\n")
+        legacy_unit.write_text(f"[Service]\nExecStart={legacy_bin} -c {legacy_conf_file}\n")
+
+        self.run_shell(r'''
+systemctl() {
+    printf '%s\n' "$*" >> "$TEST_ROOT/systemctl.log"
+    if [[ $1 == list-unit-files ]]; then
+        printf 'snell-server.service enabled\n'
+        return 0
+    fi
+    return 0
+}
+scan_existing_snell
+[[ $FOUND_ANY == 1 && $FOUND_STANDARD == 0 ]]
+uninstall_existing_snell
+[[ $REINSTALL == 0 && $REUSE_CONFIG == 0 && $REUSE_UNIT == 0 ]]
+[[ -n $LEGACY_BACKUP && -d $LEGACY_BACKUP ]]
+''')
+        self.assertFalse(legacy_unit.exists())
+        self.assertFalse(legacy_bin.exists())
+        self.assertFalse(legacy_conf.exists())
+        self.assertFalse(self.binary.exists())
+        self.assertFalse(self.config.exists())
+        sys_log = (self.root / "systemctl.log").read_text()
+        self.assertIn("stop snell-server.service", sys_log)
+        self.assertIn("disable snell-server.service", sys_log)
+        backups = list((self.root / "backups").glob("legacy-backup-*"))
+        self.assertEqual(len(backups), 1)
+        self.assertTrue((backups[0] / "snell-server.service").exists())
+
+    def test_reinstall_reject_allows_clean_fallback(self):
+        self.config.write_text("[snell-server]\nlisten = 127.0.0.1:1234\npsk = example\n")
+        self.run_shell(r'''
+REINSTALL_ALLOW_CLEAN_FALLBACK=1
+REINSTALL_REJECT_REASON=''
+rc=0
+prepare_reinstall || rc=$?
+[[ $rc == 2 ]]
+[[ $REINSTALL_REJECT_REASON == *"公网监听格式"* ]]
+''')
+
+    def test_parse_args_clean_and_uninstall_flags(self):
+        self.run_shell(r'''
+parse_args --clean --yes -v 6 --mode unshaped
+[[ $FORCE_CLEAN == 1 && $AUTO_YES == 1 && $SNELL_MAJOR == 6 && $CLI_MODE == unshaped ]]
+''')
+        self.run_shell(r'''
+parse_args --uninstall -y
+[[ $DO_UNINSTALL == 1 && $AUTO_YES == 1 ]]
+''')
+
+    def test_configure_firewall_iptables_opens_and_persists(self):
+        fw_bin = self.root / "fw-bin"
+        fw_bin.mkdir()
+        (fw_bin / "iptables").write_text(f'''#!/bin/sh
+printf '%s\\n' "$*" >> "{self.root}/iptables.log"
+case "$1" in
+    -S)
+        printf '%s\\n' "-P INPUT ACCEPT"
+        printf '%s\\n' "-A INPUT -j REJECT --reject-with icmp-host-prohibited"
+        exit 0
+        ;;
+    -C) exit 1 ;;
+    -I) exit 0 ;;
+esac
+''')
+        (fw_bin / "netfilter-persistent").write_text(f'''#!/bin/sh
+printf '%s\\n' "$*" >> "{self.root}/netfilter-persistent.log"
+exit 0
+''')
+        for p in (fw_bin / "iptables", fw_bin / "netfilter-persistent"):
+            p.chmod(0o755)
+
+        out = self.run_shell(f'''
+PATH="{fw_bin}:/usr/bin:/bin"
+OS_FAMILY=debian
+INIT_SYS=systemd
+configure_firewall 34567
+printf 'STATUS=%s\\n' "$FIREWALL_STATUS"
+''').stdout
+        ipt_log = (self.root / "iptables.log").read_text()
+        self.assertIn("-I INPUT 1 -p tcp --dport 34567 -j ACCEPT", ipt_log)
+        self.assertIn("-I INPUT 1 -p udp --dport 34567 -j ACCEPT", ipt_log)
+        self.assertEqual((self.root / "netfilter-persistent.log").read_text(), "save\n")
+        self.assertIn("已持久化保存", out)
+
+    def test_configure_firewall_nftables_parses_blocking_chains_and_persists(self):
+        nft_out = self.root / "nft-rules.txt"
+        nft_out.write_text('''table inet filter {
+\tchain input {
+\t\ttype filter hook input priority filter; policy drop;
+\t\tct state established,related accept
+\t}
+\tchain forward {
+\t\ttype filter hook forward priority filter; policy drop;
+\t}
+}
+''')
+        fw_bin = self.root / "nft-bin"
+        fw_bin.mkdir()
+        (fw_bin / "nft").write_text(f'''#!/bin/sh
+printf '%s\\n' "$*" >> "{self.root}/nft.log"
+if [ "$1" = "list" ] && [ "$2" = "ruleset" ]; then
+    cat "{nft_out}"
+    exit 0
+fi
+if [ "$1" = "list" ] && [ "$2" = "chain" ]; then
+    exit 0
+fi
+exit 0
+''')
+        (fw_bin / "nft").chmod(0o755)
+
+        self.run_shell(f'''
+PATH="{fw_bin}:/usr/bin:/bin"
+OS_FAMILY=alpine
+INIT_SYS=openrc
+rc-service() {{
+    printf '%s\\n' "$*" >> "{self.root}/rc-service-fw.log"
+    return 1
+}}
+# Redirect /etc/nftables.nft via overriding persist_nftables target check:
+chains=$(nft_blocking_input_chains)
+[[ $chains == "inet filter input" ]]
+''')
 
 
 if __name__ == "__main__":
     unittest.main()
+
