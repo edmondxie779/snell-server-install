@@ -9,7 +9,7 @@
 连上 VPS 粘贴运行（`root` 用户或 Alpine 把 `sudo sh` 改成 `sh`）：
 
 ```bash
-curl -fL --retry 2 https://raw.githubusercontent.com/edmondxie779/vps-scripts/main/install-snell.sh -o install-snell.sh && sudo sh install-snell.sh
+curl -fL --retry 2 https://raw.githubusercontent.com/edmondxie779/snell-server-install/main/install-snell.sh -o install-snell.sh && sudo sh install-snell.sh
 ```
 
 按提示完成两步即可：
