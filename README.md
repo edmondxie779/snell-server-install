@@ -44,7 +44,7 @@ sudo cat /etc/snell/surge-proxy.txt          # 查看保存的节点配置
 sudo systemctl status snell --no-pager       # 查看状态（Alpine 用 rc-service snell status）
 sudo systemctl restart snell                 # 重启服务（Alpine 用 rc-service snell restart）
 sudo cat /var/log/snell-install.log          # 查看安装日志
-sudo sh install-snell.sh --uninstall         # 备份并彻底卸载 Snell
+sudo sh install-snell.sh --uninstall         # 备份并彻底卸载 Snell（同时清理系统防火墙放行规则）
 ```
 
 进阶免交互参数：`--version 4|5|6`、`--clean`（强制卸载旧版重装）、`--yes`（自动确认）。官方协议说明见 [Snell 文档](https://kb.nssurge.com/surge-knowledge-base/zh/release-notes/snell)。
