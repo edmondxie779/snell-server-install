@@ -95,6 +95,9 @@ delgroup() { printf '%s\n' "$*" >> "$TEST_ROOT/delgroup.log"; }
 if [[ $(uname -s) == Darwin ]]; then
     file_identity() { stat -f '%d:%i' "$1"; }
 fi
+# Never touch the real host firewall from tests; the real function stays reachable.
+eval "real_remove_firewall_rules() $(declare -f remove_firewall_rules | tail -n +2)"
+remove_firewall_rules() { printf '%s\n' "$1" >> "$TEST_ROOT/fw-remove.log"; }
 '''
 
     def run_shell(self, commands, expect=0, stdin_text=None):
@@ -517,6 +520,149 @@ uninstall_existing_snell
         backups = list((self.root / "backups").glob("legacy-backup-*"))
         self.assertEqual(len(backups), 1)
         self.assertTrue((backups[0] / "snell-server.service").exists())
+        removed_ports = (self.root / "fw-remove.log").read_text().split()
+        self.assertEqual(sorted(removed_ports), ["19999", "32568"])
+
+    def test_scan_ignores_unrelated_units_named_snell(self):
+        systemd = self.root / "systemd"
+        systemd.mkdir()
+        tools = self.root / "tools"
+        tools.mkdir()
+        shadow_tls = tools / "shadow-tls"
+        shadow_tls.write_text("shadow-tls\n")
+        wrapper = tools / "bash"
+        wrapper.write_text("not-snell\n")
+        conf_dir = self.root / "etc-dir"
+        conf_dir.mkdir()
+        (systemd / "shadow-tls-snell.service").write_text(
+            f"[Service]\nExecStart={shadow_tls} --v3 server --listen 0.0.0.0:443\n")
+        (systemd / "snell-wrapper.service").write_text(
+            f"[Service]\nExecStart={wrapper} /root/snell-server -c {conf_dir}\n")
+        self.run_shell(r'''
+systemctl() { [[ $1 == list-unit-files ]] && return 0; return 0; }
+scan_existing_snell
+for u in "${FOUND_SYSTEMD_UNITS[@]+"${FOUND_SYSTEMD_UNITS[@]}"}"; do
+    [[ $u != shadow-tls-snell.service ]] || exit 11
+done
+printf '%s\n' "${FOUND_SYSTEMD_UNITS[@]}" | grep -qx snell-wrapper.service || exit 12
+for b in "${FOUND_BINS[@]}"; do [[ ${b##*/} == snell-server* ]] || exit 13; done
+for c in "${FOUND_CONFS[@]}"; do [[ $c != "$TEST_ROOT/etc-dir" ]] || exit 14; done
+''')
+
+    def test_collect_config_ports(self):
+        multi = self.root / "multi.conf"
+        multi.write_text("[snell-server]\nlisten = 0.0.0.0:41000, [::]:41000\npsk = x\n")
+        out = self.run_shell(f'''
+collect_config_ports "{multi}"
+collect_config_ports "$CONF_DIR"
+collect_config_ports "$TEST_ROOT/missing"
+''').stdout.split()
+        self.assertEqual(out, ["41000", "32568"])
+
+    def test_persist_nftables_writes_only_own_block_and_removal_strips_it(self):
+        conf = self.root / "nftables.conf"
+        original = "#!/usr/sbin/nft -f\nflush ruleset\ntable inet filter {\n}\n"
+        conf.write_text(original)
+        fw_bin = self.root / "nft-bin"
+        fw_bin.mkdir()
+        (fw_bin / "nft").write_text(f'''#!/bin/sh
+printf '%s\\n' "$*" >> "{self.root}/nft.log"
+exit 0
+''')
+        (fw_bin / "nft").chmod(0o755)
+        self.run_shell(f'''
+PATH="{fw_bin}:/usr/bin:/bin"
+OS_FAMILY=debian
+INIT_SYS=systemd
+NFT_CONF_PATH="{conf}"
+persist_nftables 34567 "inet filter input"
+persist_nftables 34567 "inet filter input"
+''')
+        text = conf.read_text()
+        self.assertTrue(text.startswith(original))
+        self.assertEqual(text.count("# >>> snell-auto-34567"), 1)
+        self.assertIn('insert rule inet filter input tcp dport 34567 accept comment "snell-auto-34567-tcp"', text)
+        self.assertIn('insert rule inet filter input udp dport 34567 accept comment "snell-auto-34567-udp"', text)
+        self.assertNotIn("list ruleset", (self.root / "nft.log").read_text())
+        self.run_shell(f'''
+PATH="{fw_bin}:/usr/bin:/bin"
+OS_FAMILY=debian
+NFT_CONF_PATH="{conf}"
+real_remove_firewall_rules 34567
+''')
+        self.assertEqual(conf.read_text(), original)
+
+    def test_persist_nftables_refuses_when_check_fails(self):
+        conf = self.root / "nftables.conf"
+        conf.write_text("flush ruleset\n")
+        fw_bin = self.root / "nft-bin"
+        fw_bin.mkdir()
+        (fw_bin / "nft").write_text("#!/bin/sh\n[ \"$1\" = -c ] && exit 1\nexit 0\n")
+        (fw_bin / "nft").chmod(0o755)
+        self.run_shell(f'''
+PATH="{fw_bin}:/usr/bin:/bin"
+OS_FAMILY=debian
+NFT_CONF_PATH="{conf}"
+! persist_nftables 34567 "ip filter INPUT"
+''')
+        self.assertEqual(conf.read_text(), "flush ruleset\n")
+
+    def test_remove_firewall_rules_iptables(self):
+        fw_bin = self.root / "ipt-bin"
+        fw_bin.mkdir()
+        state = self.root / "ipt-state"
+        state.write_text("tcp\nudp\n")
+        (fw_bin / "iptables").write_text(f'''#!/bin/sh
+printf '%s\\n' "$*" >> "{self.root}/iptables.log"
+case "$1" in
+    -C) grep -qx "$4" "{state}" ;;
+    -D) grep -vx "$4" "{state}" > "{state}.new"; mv "{state}.new" "{state}" ;;
+    *) exit 0 ;;
+esac
+''')
+        (fw_bin / "iptables").chmod(0o755)
+        self.run_shell(f'''
+PATH="{fw_bin}:/usr/bin:/bin"
+OS_FAMILY=other
+NFT_CONF_PATH="{self.root}/none.conf"
+command() {{ if [[ $1 == -v && $2 =~ ^(ufw|firewall-cmd|ip6tables|nft|netfilter-persistent)$ ]]; then return 1; fi; builtin command "$@"; }}
+real_remove_firewall_rules 34567
+''')
+        log = (self.root / "iptables.log").read_text()
+        self.assertIn("-D INPUT -p tcp --dport 34567 -j ACCEPT", log)
+        self.assertIn("-D INPUT -p udp --dport 34567 -j ACCEPT", log)
+        self.assertEqual(state.read_text(), "")
+
+    def test_debian_does_not_install_iptables_persistent_over_ufw(self):
+        fw_bin = self.root / "deb-bin"
+        fw_bin.mkdir()
+        (fw_bin / "dpkg-query").write_text("#!/bin/sh\n[ \"$3\" = ufw ] && printf 'install ok installed'\nexit 0\n")
+        (fw_bin / "apt-get").write_text(f"#!/bin/sh\necho \"$*\" >> {self.root}/apt.log\n")
+        (fw_bin / "debconf-set-selections").write_text("#!/bin/sh\ncat >/dev/null\n")
+        for f in fw_bin.iterdir():
+            f.chmod(0o755)
+        out = self.run_shell(f'''
+PATH="{fw_bin}:/usr/bin:/bin"
+OS_FAMILY=debian
+command() {{ if [[ $1 == -v && $2 == netfilter-persistent ]]; then return 1; fi; builtin command "$@"; }}
+[[ ! -d /etc/iptables ]] || exit 0
+! persist_iptables
+''').stdout
+        self.assertFalse((self.root / "apt.log").exists())
+
+    def test_run_task_logs_output_and_reports_failure(self):
+        log = self.root / "install.log"
+        result = self.run_shell(f'''
+INSTALL_LOG="{log}"
+run_task "good step" printf 'hello-from-task\\n'
+if run_task "bad step" sh -c 'echo boom; exit 3'; then exit 9; fi
+''')
+        self.assertIn("✔ good step", result.stdout)
+        self.assertIn("bad step（失败）", result.stderr)
+        self.assertIn("boom", result.stderr)
+        text = log.read_text()
+        self.assertIn("hello-from-task", text)
+        self.assertNotIn("\x1b", result.stdout)
 
     def test_reinstall_reject_allows_clean_fallback(self):
         self.config.write_text("[snell-server]\nlisten = 127.0.0.1:1234\npsk = example\n")
